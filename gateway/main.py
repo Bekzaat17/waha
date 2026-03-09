@@ -80,14 +80,21 @@ async def handle_webhook(request: Request):
     if data.get("event") == "message":
         payload = data.get("payload", {})
         sender = payload.get("from", "").split('@')[0]
-
+        # ищем конкретный домен
         target_domain = routing_map.get(sender)
+        # формируем список доменов для отправки
         if target_domain:
-            target_url = f"{target_domain.rstrip('/')}/notifications/api/whatsapp/webhook/"
+            domains_to_send = [target_domain]
+        else:
+            # если нет конкретного, шлём всем
+            domains_to_send = list(routing_map.values())
+
+        for domain in domains_to_send:
+            target_url = f"{domain.rstrip('/')}/notifications/api/whatsapp/webhook/"
             try:
-                # Пересылаем вебхук в конкретный Django
-                requests.post(target_url, json=data, timeout=3)
+                headers = {"X-Api-Key": API_KEY}
+                requests.post(target_url, json=data, headers=headers, timeout=3)
             except Exception as e:
-                print(f"Forwarding error: {e}")
+                print(f"Forwarding error to {domain}: {e}")
 
     return {"status": "ok"}
