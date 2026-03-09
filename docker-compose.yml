@@ -5,6 +5,8 @@ services:
     image: devlikeapro/waha
     container_name: waha_service
     restart: always
+    env_file:
+      - .env
     expose:
       - "3000"
     environment:
@@ -29,6 +31,8 @@ services:
     build: ./gateway
     container_name: whatsapp_gateway
     restart: always
+    env_file:
+      - .env
     expose:
       - "8000"
     environment:
