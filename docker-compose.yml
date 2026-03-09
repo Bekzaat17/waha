@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   waha:
     image: devlikeapro/waha
@@ -20,6 +22,8 @@ services:
       resources:
         limits:
           memory: 512M
+        reservations:
+          memory: 256M
 
   whatsapp-gateway:
     build: ./gateway
@@ -40,6 +44,8 @@ services:
       resources:
         limits:
           memory: 128M
+        reservations:
+          memory: 64M
 
 networks:
   core_backend:
