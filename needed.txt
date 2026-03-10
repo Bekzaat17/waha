@@ -1,0 +1,10 @@
+mkdir -p /opt/waha/waha_sessions
+mkdir -p /opt/waha/gateway/data
+
+# Даем права на чтение/запись для папок с данными
+chmod -R 775 waha_sessions
+chmod -R 775 gateway/data
+
+# На всякий случай меняем владельца на текущего пользователя (root)
+chown -R root:root waha_sessions
+chown -R root:root gateway/data
