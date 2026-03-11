@@ -1,11 +1,14 @@
 import json
 import os
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 
 app = FastAPI()
+
+# Путь к базе данных номеров и доменов
 DB_FILE = "/app/data/routes.json"
-# Берем ключ из .env (который мы прописали в docker-compose)
+
+# API Ключ для защиты управления и для связи с Django
 API_KEY = os.getenv("GATEWAY_API_KEY", "fallback_key_if_env_is_missing")
 
 routing_map = {}
@@ -17,7 +20,8 @@ def load_db():
         try:
             with open(DB_FILE, "r") as f:
                 routing_map = json.load(f)
-        except:
+        except Exception as e:
+            print(f"Error loading DB: {e}")
             routing_map = {}
 
 
@@ -26,13 +30,33 @@ def save_db():
         json.dump(routing_map, f)
 
 
+# Загружаем базу при старте
 load_db()
 
 
-# --- Middleware для защиты ---
+def send_to_backend(domain, data):
+    """
+    Функция отправки на Django бэкенд.
+    Выполняется в фоне, не заставляя WAHA ждать.
+    """
+    base_url = domain.rstrip('/')
+    target_url = f"{base_url}/notifications/api/whatsapp/webhook/"
+    try:
+        # Ставим таймаут 10, так как в фоне это не мешает работе шлюза
+        requests.post(
+            target_url,
+            json=data,
+            headers={"X-Api-Key": API_KEY},
+            timeout=10
+        )
+    except Exception as e:
+        # Логируем ошибку, если бэкенд недоступен
+        print(f"[ERROR] Failed to send to {domain}: {e}")
+
+
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # Защищаем методы управления, но оставляем открытым /webhook для WAHA
+    # Защищаем эндпоинты управления
     if request.url.path in ["/register", "/list", "/remove"]:
         key = request.headers.get("X-Api-Key")
         if key != API_KEY:
@@ -40,29 +64,22 @@ async def verify_api_key(request: Request, call_next):
     return await call_next(request)
 
 
-# --- Эндпоинты ---
+# --- Эндпоинты управления ---
 
 @app.post("/register")
 async def register(request: Request):
     data = await request.json()
     phone = str(data.get("phone"))
-    domain = data.get("domain")  # Ожидаем полный URL типа https://pulse.rehubpro.kz
+    domain = data.get("domain")
     if phone and domain:
-        routing_map[phone] = domain  # Прямая запись номер-домен
+        routing_map[phone] = domain
         save_db()
     return {"status": "ok"}
 
 
 @app.get("/list")
 async def list_all():
-    """Отдать всё для глобальной сверки"""
     return routing_map
-
-
-@app.get("/list/{domain_query}")
-async def list_by_domain(domain_query: str):
-    """Отдать номера конкретного домена"""
-    return {p: d for p, d in routing_map.items() if domain_query in d}
 
 
 @app.delete("/remove/{phone}")
@@ -73,28 +90,41 @@ async def remove_phone(phone: str):
     return {"status": "ok"}
 
 
+# --- Основной Webhook ---
+
 @app.post("/webhook")
-async def handle_webhook(request: Request):
-    data = await request.json()
-    # WAHA присылает событие 'message' (или 'message.upsert' в новых версиях)
-    if data.get("event") == "message":
-        payload = data.get("payload", {})
-        sender = payload.get("from", "").split('@')[0]
-        # ищем конкретный домен
-        target_domain = routing_map.get(sender)
-        # формируем список доменов для отправки
-        if target_domain:
-            domains_to_send = [target_domain]
-        else:
-            # если нет конкретного, шлём всем
-            domains_to_send = list(routing_map.values())
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+    except:
+        return {"status": "error", "message": "invalid json"}
 
-        for domain in domains_to_send:
-            target_url = f"{domain.rstrip('/')}/notifications/api/whatsapp/webhook/"
-            try:
-                headers = {"X-Api-Key": API_KEY}
-                requests.post(target_url, json=data, headers=headers, timeout=3)
-            except Exception as e:
-                print(f"Forwarding error to {domain}: {e}")
+    # Работаем только с сообщениями
+    if data.get("event") not in ["message", "message.upsert"]:
+        return {"status": "ignored"}
 
-    return {"status": "ok"}
+    payload = data.get("payload", {})
+    _data = payload.get("_data", {})
+    key = _data.get("key", {})
+
+    # 1. Каскадный поиск реального номера отправителя
+    # Сначала remoteJidAlt (самый надежный для обхода LID), потом participant, потом from
+    sender_raw = key.get("remoteJidAlt") or payload.get("participant") or payload.get("from", "")
+
+    # Очищаем от тех. суффиксов (@c.us, @s.whatsapp.net, @lid)
+    sender = sender_raw.split('@')[0] if sender_raw else None
+
+    # 2. Определяем, кому отправлять (убираем дубли доменов)
+    target_domain = routing_map.get(sender)
+    if target_domain:
+        unique_domains = {target_domain}
+    else:
+        # Если номер не в базе (LID или новый клиент) — шлем всем уникальным доменам
+        unique_domains = set(routing_map.values())
+
+    # 3. Добавляем задачи на отправку в фон
+    for domain in unique_domains:
+        background_tasks.add_task(send_to_backend, domain, data)
+
+    # МГНОВЕННЫЙ ОТВЕТ: WAHA увидит это и не будет делать повторных попыток (retries)
+    return {"status": "ok", "queued_tasks": len(unique_domains)}
