@@ -1,0 +1,5 @@
+# Секреты и данные — не коммитим
+.env
+waha_sessions/
+gateway/data/
+__pycache__/
