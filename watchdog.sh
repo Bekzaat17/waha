@@ -43,6 +43,15 @@ check_container() {
 check_container whatsapp_gateway
 check_container waha_service || exit 0
 
+# Память: лимит контейнера 1 GiB. Перезапускаем заранее, не дожидаясь OOM-kill
+MEM_LIMIT_MB=850
+MEM=$(docker exec waha_service sh -c "awk '/^anon /{print \$2}' /sys/fs/cgroup/memory.stat" 2>/dev/null)
+if [ -n "$MEM" ] && [ $(( MEM / 1048576 )) -ge $MEM_LIMIT_MB ]; then
+    log "waha_service занимает $(( MEM / 1048576 )) MiB (порог $MEM_LIMIT_MB) — перезапускаю"
+    docker restart -t 30 waha_service >> "$LOG" 2>&1
+    exit 0
+fi
+
 api() { docker exec waha_service curl -s -m 15 -H "X-Api-Key: $KEY" "$@"; }
 
 STATUS=$(api "http://localhost:3000/api/sessions/$SESSION" | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null)

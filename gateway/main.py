@@ -1,13 +1,27 @@
+import hmac
 import json
+import logging
 import os
+import re
+import shutil
+import threading
+import time
+
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse, Response
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("gateway")
 
 app = FastAPI()
 
 # Путь к базе данных номеров и доменов
 DB_FILE = "/app/data/routes.json"
+DB_BACKUP = DB_FILE + ".bak"
+
+# Файлы сессии WAHA (только чтение): lid-mapping-<LID>_reverse.json хранит номер телефона
+LID_DIR = os.getenv("WAHA_LID_DIR", "/app/waha_lids")
 
 # API Ключ для защиты управления и для связи с Django
 API_KEY = os.getenv("GATEWAY_API_KEY")
@@ -16,6 +30,8 @@ if not API_KEY:
 
 # Секрет, который WAHA присылает в заголовке X-Webhook-Secret
 WEBHOOK_SECRET = os.getenv("GATEWAY_WEBHOOK_SECRET")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("GATEWAY_WEBHOOK_SECRET is not set")
 
 # Для страницы входа по QR
 WAHA_INTERNAL_URL = os.getenv("WAHA_INTERNAL_URL", "http://waha_service:3000")
@@ -23,47 +39,119 @@ WAHA_API_KEY = os.getenv("WAHA_API_KEY")
 WAHA_SESSION = os.getenv("WAHA_SESSION", "default")
 LOGIN_TOKEN = os.getenv("GATEWAY_LOGIN_TOKEN")
 
+# Повторы доставки в Django, если бэкенд временно недоступен
+BACKEND_RETRY_DELAYS = (2, 10, 30)
+
 routing_map = {}
+db_lock = threading.Lock()
+
+
+def secure_equals(a, b):
+    return bool(a) and bool(b) and hmac.compare_digest(str(a), str(b))
+
+
+def normalize_phone(value):
+    """Та же нормализация, что в Django PhoneService.normalize: 7XXXXXXXXXX или None."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return digits
+    return None
+
+
+def read_routes(path):
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("routes must be a JSON object")
+    return data
 
 
 def load_db():
     global routing_map
-    if os.path.exists(DB_FILE):
+    for path in (DB_FILE, DB_BACKUP):
+        if not os.path.exists(path):
+            continue
         try:
-            with open(DB_FILE, "r") as f:
-                routing_map = json.load(f)
+            routing_map = read_routes(path)
+            log.info("Loaded %d routes from %s", len(routing_map), path)
+            return
         except Exception as e:
-            print(f"Error loading DB: {e}")
-            routing_map = {}
+            log.error("Error loading %s: %s", path, e)
+    routing_map = {}
+    log.warning("Routes are empty")
 
 
 def save_db():
-    with open(DB_FILE, "w") as f:
-        json.dump(routing_map, f)
+    # Атомарная запись: сначала во временный файл, потом rename.
+    # Если процесс упадёт посреди записи, старый routes.json останется целым.
+    with db_lock:
+        tmp = DB_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(routing_map, f, ensure_ascii=False, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(DB_FILE):
+            shutil.copy2(DB_FILE, DB_BACKUP)
+        os.replace(tmp, DB_FILE)
 
 
 # Загружаем базу при старте
 load_db()
 
 
+def lid_to_phone(lid):
+    """Номер телефона по LID из файлов сессии WAHA (без включения NOWEB store)."""
+    if not lid.isdigit():
+        return None
+    try:
+        with open(os.path.join(LID_DIR, f"lid-mapping-{lid}_reverse.json")) as f:
+            return normalize_phone(json.load(f))
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_sender(payload):
+    """
+    Возвращает номер отправителя 7XXXXXXXXXX или None.
+    Порядок: remoteJidAlt (самый надежный для обхода LID), participant, from.
+    """
+    key = (payload.get("_data") or {}).get("key") or {}
+    for raw in (key.get("remoteJidAlt"), payload.get("participant"), payload.get("from")):
+        if not raw:
+            continue
+        user, _, server = str(raw).partition("@")
+        if server == "lid":
+            phone = lid_to_phone(user)
+        elif server == "g.us":
+            continue
+        else:
+            phone = normalize_phone(user)
+        if phone:
+            return phone
+    return None
+
+
 def send_to_backend(domain, data):
     """
     Функция отправки на Django бэкенд.
-    Выполняется в фоне, не заставляя WAHA ждать.
+    Выполняется в фоне, не заставляя WAHA ждать. При сетевой ошибке или 5xx — повторяем.
     """
-    base_url = domain.rstrip('/')
-    target_url = f"{base_url}/notifications/api/whatsapp/webhook/"
-    try:
-        # Ставим таймаут 10, так как в фоне это не мешает работе шлюза
-        requests.post(
-            target_url,
-            json=data,
-            headers={"X-Api-Key": API_KEY},
-            timeout=10
-        )
-    except Exception as e:
-        # Логируем ошибку, если бэкенд недоступен
-        print(f"[ERROR] Failed to send to {domain}: {e}")
+    target_url = f"{domain.rstrip('/')}/notifications/api/whatsapp/webhook/"
+    for attempt, delay in enumerate((0,) + BACKEND_RETRY_DELAYS, start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            r = requests.post(target_url, json=data, headers={"X-Api-Key": API_KEY}, timeout=10)
+            if r.status_code < 500:
+                if r.status_code >= 400:
+                    log.warning("Backend %s answered %s: %s", domain, r.status_code, r.text[:200])
+                return
+            log.warning("Backend %s answered %s (attempt %d)", domain, r.status_code, attempt)
+        except Exception as e:
+            log.warning("Failed to send to %s (attempt %d): %s", domain, attempt, e)
+    log.error("Giving up delivering message to %s", domain)
 
 
 @app.middleware("http")
@@ -71,10 +159,10 @@ async def verify_api_key(request: Request, call_next):
     # Защищаем эндпоинты управления
     path = request.url.path
     if path in ("/register", "/list") or path.startswith("/remove/"):
-        if request.headers.get("X-Api-Key") != API_KEY:
+        if not secure_equals(request.headers.get("X-Api-Key"), API_KEY):
             return JSONResponse({"detail": "Forbidden: Invalid API Key"}, status_code=403)
-    elif path == "/webhook" and WEBHOOK_SECRET:
-        if request.headers.get("X-Webhook-Secret") != WEBHOOK_SECRET:
+    elif path == "/webhook":
+        if not secure_equals(request.headers.get("X-Webhook-Secret"), WEBHOOK_SECRET):
             return JSONResponse({"detail": "Forbidden"}, status_code=403)
     return await call_next(request)
 
@@ -83,17 +171,22 @@ async def verify_api_key(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "routes": len(routing_map)}
 
 
 @app.post("/register")
 async def register(request: Request):
     data = await request.json()
-    phone = str(data.get("phone"))
-    domain = data.get("domain")
-    if phone and domain:
+    phone = normalize_phone(data.get("phone"))
+    domain = str(data.get("domain") or "").rstrip("/")
+    if not phone or not domain.startswith("https://") or "localhost" in domain:
+        log.warning("Rejected register: phone=%r domain=%r", data.get("phone"), data.get("domain"))
+        return JSONResponse({"status": "error", "detail": "invalid phone or domain"}, status_code=400)
+    if routing_map.get(phone) != domain:
+        old = routing_map.get(phone)
         routing_map[phone] = domain
         save_db()
+        log.info("Registered %s -> %s%s", phone, domain, f" (was {old})" if old else "")
     return {"status": "ok"}
 
 
@@ -104,13 +197,18 @@ async def list_all():
 
 @app.delete("/remove/{phone}")
 async def remove_phone(phone: str):
+    if phone not in routing_map:
+        phone = normalize_phone(phone) or phone
     if phone in routing_map:
         del routing_map[phone]
         save_db()
+        log.info("Removed %s", phone)
     return {"status": "ok"}
 
 
 # --- Вход в WhatsApp по QR ---
+# Обычные (не async) функции: FastAPI выполняет их в пуле потоков,
+# поэтому медленный ответ WAHA не блокирует приём вебхуков.
 
 def waha_request(method, path, **kwargs):
     return requests.request(
@@ -123,7 +221,7 @@ def waha_request(method, path, **kwargs):
 
 
 def check_login_token(token):
-    return bool(LOGIN_TOKEN) and token == LOGIN_TOKEN
+    return secure_equals(token, LOGIN_TOKEN)
 
 
 LOGIN_PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
@@ -138,7 +236,7 @@ img{width:100%;max-width:320px}.ok{color:#128c3e;font-size:20px}.muted{color:#66
 
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(token: str = ""):
+def login_page(token: str = ""):
     if not check_login_token(token):
         return HTMLResponse("Forbidden", status_code=403)
     try:
@@ -167,7 +265,7 @@ async def login_page(token: str = ""):
 
 
 @app.get("/login/qr.png")
-async def login_qr(token: str = ""):
+def login_qr(token: str = ""):
     if not check_login_token(token):
         return Response(status_code=403)
     try:
@@ -186,35 +284,30 @@ async def login_qr(token: str = ""):
 async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         data = await request.json()
-    except:
+    except Exception:
         return {"status": "error", "message": "invalid json"}
 
     # Работаем только с сообщениями
     if data.get("event") not in ["message", "message.upsert"]:
         return {"status": "ignored"}
 
-    payload = data.get("payload", {})
-    _data = payload.get("_data", {})
-    key = _data.get("key", {})
+    payload = data.get("payload") or {}
+    phone = resolve_sender(payload)
+    if not phone:
+        log.info("Unresolved sender from=%s participant=%s", payload.get("from"), payload.get("participant"))
+        return {"status": "ignored", "reason": "unresolved sender"}
 
-    # 1. Каскадный поиск реального номера отправителя
-    # Сначала remoteJidAlt (самый надежный для обхода LID), потом participant, потом from
-    sender_raw = key.get("remoteJidAlt") or payload.get("participant") or payload.get("from", "")
+    # Подставляем настоящий номер, чтобы Django не споткнулся об LID
+    payload.setdefault("_data", {}).setdefault("key", {})["remoteJidAlt"] = f"{phone}@s.whatsapp.net"
 
-    # Очищаем от тех. суффиксов (@c.us, @s.whatsapp.net, @lid)
-    sender = sender_raw.split('@')[0] if sender_raw else None
+    # Шлём только тому клиенту, за которым закреплён номер.
+    # Неизвестные номера никуда не пересылаем — чтобы сообщения не попадали в чужие системы.
+    domain = routing_map.get(phone)
+    if not domain:
+        log.info("No route for %s, message dropped", phone)
+        return {"status": "ignored", "reason": "no route"}
 
-    # 2. Определяем, кому отправлять (убираем дубли доменов)
-    target_domain = routing_map.get(sender)
-    if target_domain:
-        unique_domains = {target_domain}
-    else:
-        # Если номер не в базе (LID или новый клиент) — шлем всем уникальным доменам
-        unique_domains = set(routing_map.values())
-
-    # 3. Добавляем задачи на отправку в фон
-    for domain in unique_domains:
-        background_tasks.add_task(send_to_backend, domain, data)
+    background_tasks.add_task(send_to_backend, domain, data)
 
     # МГНОВЕННЫЙ ОТВЕТ: WAHA увидит это и не будет делать повторных попыток (retries)
-    return {"status": "ok", "queued_tasks": len(unique_domains)}
+    return {"status": "ok", "queued_tasks": 1}

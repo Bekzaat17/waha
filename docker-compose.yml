@@ -23,6 +23,11 @@ services:
       - WAHA_PRINT_QR=true
       - WHATSAPP_API_KEY_EXCLUDE_PATH=ping,health
       - TZ=Asia/Almaty
+      # В образе стоит 16 ГБ — Node почти не чистит память и упирается в лимит контейнера (1G).
+      # 640 МБ под heap: сборщик мусора работает раньше, остаётся запас до лимита.
+      - NODE_OPTIONS=--max-old-space-size=640
+      # Медиа из входящих нам не нужны — не скачиваем их на каждое событие
+      - WAHA_EVENTS_DOWNLOAD_MEDIA=false
     volumes:
       - ./waha_sessions:/app/.sessions
     networks:
@@ -56,6 +61,8 @@ services:
       - TZ=Asia/Almaty
     volumes:
       - ./gateway/data:/app/data
+      # Только чтение: gateway берёт отсюда номер телефона по LID
+      - ./waha_sessions/noweb/default:/app/waha_lids:ro
     networks:
       core_backend:
         aliases:
